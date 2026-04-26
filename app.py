@@ -1,91 +1,110 @@
+import os
 import telebot
 from flask import Flask, request
 import requests
 import json
 from thefuzz import process, fuzz
-import time
 
-# ================= CONFIG =================
-BOT_TOKEN = "8756073920:AAHLxNUimw-8uyjGFUs2HakKQ7NqdGYWeiI"
-# သင့် Space URL ကို ဒီမှာ အမှန်ထည့်ပါ (ဥပမာ https://theo-mflixer.hf.space)
-# အဆုံးမှာ / မပါစေနဲ့
-SPACE_URL = "https://theo139-mflixer-movie.hf.space" 
+# ================= CONFIG (From Environment Variables) =================
+# Render ရဲ့ Dashboard > Environment မှာ သွားထည့်ပေးရမယ့် Key များ
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GOOGLE_SCRIPT_URL = os.getenv("GOOGLE_SCRIPT_URL")
+SECRET_KEY = os.getenv("SECRET_KEY")
 
-GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbyrA8Vlul_hED8hjCr88ulet-MzxOqWQrU2MwDLhJsKN6nP--1dOC1vM8ChNo63TDa1lg/exec"
-SECRET_KEY = "Mflixer_Secret_99"
-SOURCE_GROUP_ID = -1003946938849
-ADMIN_ID = 1774839794
+# Default ID များ (Environment မှာ မထည့်ထားရင် ဒီ ID တွေကို သုံးမယ်)
+SOURCE_GROUP_ID = int(os.getenv("SOURCE_GROUP_ID", "-1003946938849"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "1774839794"))
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
-# ================= HOME & WEBHOOK SETTER =================
+# ================= HOME (For Monitoring) =================
 @app.route("/", methods=["GET"])
 def home():
-    # ဒီ Route ကို Browser မှာ ဖွင့်လိုက်တာနဲ့ Webhook ကို အလိုအလျောက် ချိတ်ပေးမယ်
-    webhook_url = f"{SPACE_URL}/{BOT_TOKEN}/Webhook"
-    bot.remove_webhook()
-    time.sleep(1)
-    success = bot.set_webhook(url=webhook_url)
-    if success:
-        return f"✅ Webhook Set Successfully! <br> URL: {webhook_url}", 200
-    else:
-        return "❌ Webhook Set Failed!", 500
+    return "Bot is running on Webhook Mode", 200
 
-# ================= WEBHOOK RECEIVER =================
-@app.route(f"/{BOT_TOKEN}/Webhook", methods=["POST"])
+# ================= WEBHOOK ROUTE =================
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def telegram_webhook():
     if request.headers.get('content-type') == 'application/json':
         json_string = request.get_data().decode('utf-8')
         update = telebot.types.Update.de_json(json_string)
         bot.process_new_updates([update])
         return "OK", 200
-    return "Forbidden", 403
+    else:
+        return "Invalid Request", 403
 
 # ================= START COMMAND =================
 @bot.message_handler(commands=['start'])
 def start(message):
-    try:
-        args = message.text.split()
-        if len(args) > 1 and args[1].isdigit():
-            bot.copy_message(message.chat.id, SOURCE_GROUP_ID, int(args[1]))
-            return
-        bot.reply_to(message, "✅ Mflixer Movie Bot is running!\n\nစာရိုက်ပြီး ဇာတ်ကားရှာနိုင်ပါပြီ 🎬")
-    except Exception as e:
-        print(f"Start error: {e}")
+    bot.reply_to(message, "✅ Mflixer Movie Bot (Webhook Mode) အလုပ်လုပ်နေပါပြီ")
 
-# ================= SEARCH LOGIC =================
+# ================= ADMIN POST (သိမ်းဆည်းရန်) =================
+@bot.message_handler(content_types=['photo'])
+def handle_admin_post(message):
+    try:
+        # Admin ID ကို စစ်ဆေးမယ်
+        if message.from_user.id == ADMIN_ID and message.caption:
+            title = message.caption.split('\n')[0]
+            msg_id = message.message_id
+            
+            payload = {
+                "key": SECRET_KEY,
+                "action": "insert",
+                "name": title,
+                "id": msg_id
+            }
+            
+            r = requests.post(GOOGLE_SCRIPT_URL, data=json.dumps(payload), timeout=25)
+            if "Success" in r.text:
+                bot.reply_to(message, f"✅ Saved: {title}")
+            else:
+                bot.reply_to(message, "❌ Database Error")
+    except Exception as e:
+        print(f"Insert error: {e}")
+
+# ================= SEARCH (ရုပ်ရှင်ရှာရန်) =================
 @bot.message_handler(func=lambda message: True)
 def search_movie(message):
     try:
-        # နံပါတ်သက်သက် ရိုက်ရင် တိုက်ရိုက်ပို့မယ်
-        if message.text.isdigit():
-            bot.copy_message(message.chat.id, SOURCE_GROUP_ID, int(message.text))
-            return
-
-        # Google Sheets ကနေ Data ယူမယ်
         payload = {"key": SECRET_KEY, "action": "search"}
-        r = requests.post(GOOGLE_SCRIPT_URL, data=json.dumps(payload), timeout=20)
+        r = requests.post(GOOGLE_SCRIPT_URL, data=json.dumps(payload), timeout=25)
         data = r.json()
+        
         movie_list = data[1:] if len(data) > 1 else []
         
         if not movie_list:
-            bot.send_message(message.chat.id, "❌ Database ထဲမှာ အချက်အလက် မရှိပါ။")
+            bot.send_message(message.chat.id, "❌ Database ထဲမှာ ဘာမှမရှိသေးပါ")
             return
 
         names = [m[0] for m in movie_list]
-        results = process.extract(message.text, names, limit=3, scorer=fuzz.partial_token_set_ratio)
-
-        for name, score in results:
-            if score > 65:
-                target_id = next(m[1] for m in movie_list if m[0] == name)
-                bot.copy_message(message.chat.id, SOURCE_GROUP_ID, int(target_id))
-                return
         
-        bot.send_message(message.chat.id, "🔍 ရှာမတွေ့ပါ။ နာမည် အမှန်ပြန်ရိုက်ပေးပါ။")
+        # Fuzzy matching နဲ့ ကိုက်ညီမှု ရှာမယ်
+        results = process.extract(
+            message.text, 
+            names, 
+            limit=3, 
+            scorer=fuzz.partial_token_set_ratio
+        )
+
+        found = False
+        for name, score in results:
+            if score > 65: # ကိုက်ညီမှု 65% ကျော်ရင်
+                target_id = next(m[1] for m in movie_list if m[0] == name)
+                # Source Group ကနေ copy ကူးပို့ပေးမယ်
+                bot.copy_message(message.chat.id, SOURCE_GROUP_ID, int(target_id))
+                found = True
+                break
+        
+        if not found:
+            bot.send_message(message.chat.id, "🔍 ရှာမတွေ့ပါ၊ နာမည်ကို မှန်အောင် ပြန်ရိုက်ကြည့်ပါ")
+            
     except Exception as e:
         print(f"Search error: {e}")
+        bot.send_message(message.chat.id, "⚠️ Google Script နဲ့ ချိတ်ဆက်ရာမှာ အမှားရှိနေပါတယ်")
 
+# ================= RUN =================
 if __name__ == "__main__":
-    # Hugging Face ရဲ့ Default Port 7860 မှာ Run မယ်
-    app.run(host="0.0.0.0", port=7860)
+    # Render က PORT ကို အလိုအလျောက် သတ်မှတ်ပေးတာကို လက်ခံဖို့ဖြစ်ပါတယ်
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
